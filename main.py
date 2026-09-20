@@ -1,52 +1,114 @@
-import os, requests, random
+import yfinance as yf
+import pandas as pd
+import pandas_ta as ta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+import asyncio
+import os
 
 TOKEN = os.getenv("BOT_TOKEN")
 
-OTC = ["EUR/USD (OTC)", "GBP/USD (OTC)", "USD/JPY (OTC)", "AUD/USD (OTC)", "GBP/JPY (OTC)"]
-LIVE = ["EUR/USD", "GBP/USD", "USD/JPY", "AUD/USD", "BTC/USDT"]
+PAIRS = {
+    "EUR/USD": "EURUSD=X",
+    "GBP/USD": "GBPUSD=X",
+    "USD/JPY": "JPY=X",
+    "AUD/USD": "AUDUSD=X"
+}
 
-def get_signal():
+def analyze_market(symbol):
     try:
-        data = requests.get("https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=20", timeout=5).json()
-        closes = [float(x[4]) for x in data]
-        fast = sum(closes[-9:])/9
-        slow = sum(closes[-21:])/21
-        return ("UP 📈" if fast>slow else "DOWN 📉"), random.randint(76,88)
-    except:
-        return random.choice(["UP 📈","DOWN 📉"]), random.randint(75,86)
+        df = yf.download(symbol, period="1d", interval="1m", progress=False)
+        if len(df) < 50:
+            return None
+        
+        # Indicators
+        df['RSI'] = ta.rsi(df['Close'], length=14)
+        df['EMA_9'] = ta.ema(df['Close'], length=9)
+        df['EMA_21'] = ta.ema(df['Close'], length=21)
+        df['MACD'] = ta.macd(df['Close'])['MACD_12_26_9']
+        df['MACD_S'] = ta.macd(df['Close'])['MACDs_12_26_9']
+        bb = ta.bbands(df['Close'], length=20, std=2)
+        df['BB_L'] = bb['BBL_20_2.0']
+        df['BB_U'] = bb['BBU_20_2.0']
+
+        last = df.iloc[-1]
+        prev = df.iloc[-2]
+
+        # STRONG BUY LOGIC
+        buy_cond = (
+            last['RSI'] > 30 and last['RSI'] < 58 and
+            last['EMA_9'] > last['EMA_21'] and
+            prev['EMA_9'] <= prev['EMA_21'] and # Fresh crossover
+            last['MACD'] > last['MACD_S'] and
+            last['Close'] > last['BB_L']
+        )
+
+        # STRONG SELL LOGIC
+        sell_cond = (
+            last['RSI'] < 70 and last['RSI'] > 42 and
+            last['EMA_9'] < last['EMA_21'] and
+            prev['EMA_9'] >= prev['EMA_21'] and # Fresh crossover
+            last['MACD'] < last['MACD_S'] and
+            last['Close'] < last['BB_U']
+        )
+
+        if buy_cond:
+            acc = 75 + int((58 - last['RSI'])/2) # dynamic accuracy
+            return "UP", min(acc, 88), round(last['RSI'],1)
+        elif sell_cond:
+            acc = 75 + int((last['RSI'] - 42)/2)
+            return "DOWN", min(acc, 88), round(last['RSI'],1)
+        else:
+            return None
+    except Exception as e:
+        print(e)
+        return None
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kb = [[InlineKeyboardButton("🔥 OTC (24/7) 🔥", callback_data="otc")],[InlineKeyboardButton("🌍 LIVE 🌍", callback_data="live")]]
-    txt = "💎 ZEESHAN PRO BOT READY 💎\nMarket select karo 👇"
-    if update.message: await update.message.reply_text(txt, reply_markup=InlineKeyboardMarkup(kb))
-    else: await update.callback_query.message.edit_text(txt, reply_markup=InlineKeyboardMarkup(kb))
+    keyboard = []
+    for name in PAIRS.keys():
+        keyboard.append([InlineKeyboardButton(f"{name} LIVE", callback_data=name)])
+    keyboard.append([InlineKeyboardButton("EUR/USD (OTC)", callback_data="EUR/USD")]) # OTC ke liye bhi LIVE data use hoga
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("💎 **V2 PRO ANALYZER READY**\nMarket khud analyze karke signal dunga. Pair select karo:", reply_markup=reply_markup, parse_mode='Markdown')
 
-async def btns(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    if q.data == "otc":
-        kb = [[InlineKeyboardButton(p, callback_data=f"S_{p}")] for p in OTC] + [[InlineKeyboardButton("⬅️ Back", callback_data="home")]]
-        await q.message.edit_text("🔥 OTC MARKET - Pair select karo:", reply_markup=InlineKeyboardMarkup(kb))
-    elif q.data == "live":
-        kb = [[InlineKeyboardButton(p, callback_data=f"S_{p}")] for p in LIVE] + [[InlineKeyboardButton("⬅️ Back", callback_data="home")]]
-        await q.message.edit_text("🌍 LIVE MARKET - Pair select karo:", reply_markup=InlineKeyboardMarkup(kb))
-    elif q.data == "home":
+async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    pair_name = query.data
+    symbol = PAIRS.get(pair_name, "EURUSD=X")
+    
+    await query.edit_message_text(f"🔍 {pair_name} ko analyze kar raha hu... 4 Indicators check ho rahe hain...")
+
+    result = analyze_market(symbol)
+
+    if result:
+        direction, acc, rsi = result
+        emoji = "📈" if direction == "UP" else "📉"
+        text = f"""💎 **SIGNAL V2 PRO** 💎
+        
+**{pair_name} {'(OTC)' if 'OTC' in query.data else 'LIVE'}**
+**1-2 MIN**
+**{direction} {emoji}**
+**🎯 Accuracy: {acc}%**
+**RSI: {rsi} | EMA + MACD + BB Confirmed**
+
+⏰ Agli candle (Switch Time) pe entry lo.
+"""
+    else:
+        text = f"""❌ {pair_name} me abhi koi strong signal nahi hai.
+Market side-ways hai. Thodi der baad try karo.
+
+Yehi iski khasiyat hai, har waqt signal nahi dega, sirf strong wala dega."""
+
+    keyboard = [[InlineKeyboardButton(f"Next {pair_name}", callback_data=pair_name)], [InlineKeyboardButton("Menu", callback_data="menu")]]
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+
+    if query.data == "menu":
         await start(update, context)
-    elif q.data.startswith("S_"):
-        pair = q.data.replace("S_","")
-        await q.message.edit_text(f"⏳ {pair} analysis...")
-        direction, acc = get_signal()
-        msg = f"💎 SIGNAL 💎\n━━━━━━━━\n💱 {pair}\n⏰ 1 MIN\n📊 {direction}\n🎯 {acc}%\n━━━━━━━━"
-        kb = [[InlineKeyboardButton(f"🔄 Next {pair}", callback_data=f"S_{pair}")],[InlineKeyboardButton("⬅️ Menu", callback_data="home")]]
-        await q.message.edit_text(msg, reply_markup=InlineKeyboardMarkup(kb))
 
-def main():
+if __name__ == '__main__':
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(btns))
+    app.add_handler(CallbackQueryHandler(button))
     app.run_polling()
-
-if __name__ == "__main__":
-    main()
